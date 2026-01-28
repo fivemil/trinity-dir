@@ -8,147 +8,65 @@
 #include <wx/spinctrl.h>
 #include <wx/valnum.h>
 
-#include <curl/curl.h>
-
-#include "json/json_spirit_reader.h"
-#include "json/json_spirit_writer.h"
-#include "json/json_spirit_utils.h"
-
-using namespace json_spirit;
-
-namespace {
-size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
-{
-    if (!userdata)
-        return 0;
-    std::string *response = static_cast<std::string *>(userdata);
-    response->append(ptr, size * nmemb);
-    return size * nmemb;
+extern "C" {
+#include "wallet.h"
+#include "main.h"
+#include "init.h"
+#include "net.h"
+#include "util.h"
+#include "bitcoinrpc.h"
+#include "base58.h"
 }
 
-std::string JsonValueToString(const Value &value)
+#include <boost/thread.hpp>
+#include "json/json_spirit_writer.h"
+
+namespace {
+std::string FormatAmount(int64 amount)
 {
-    if (value.type() == str_type)
-        return value.get_str();
-    return write_string(value, false);
+    return FormatMoney(amount);
+}
+
+std::string GetAlgoLabel()
+{
+    return GetAlgoName(miningAlgo);
+}
+
+std::string FormatTime(int64 timeValue)
+{
+    wxDateTime dt = wxDateTime::FromTimeT(static_cast<time_t>(timeValue));
+    return dt.FormatISOCombined(' ').ToStdString();
+}
+
+bool ThreadSafeMessageBox(const std::string& message, const std::string& caption, unsigned int style)
+{
+    wxMessageBox(wxString::FromUTF8(message.c_str()), wxString::FromUTF8(caption.c_str()));
+    return true;
+}
+
+bool ThreadSafeAskFee(int64)
+{
+    return true;
+}
+
+void InitMessage(const std::string &message)
+{
+    wxLogMessage("%s", message);
+}
+
+std::string Translate(const char* psz)
+{
+    return std::string(psz);
 }
 } // namespace
 
-class RpcClient
-{
-public:
-    RpcClient() : port(6420), useSSL(false) {}
-
-    void Configure(const std::string &hostIn, int portIn, const std::string &userIn,
-                   const std::string &passwordIn, bool useSSLIn)
-    {
-        host = hostIn;
-        port = portIn;
-        user = userIn;
-        password = passwordIn;
-        useSSL = useSSLIn;
-    }
-
-    bool IsConfigured() const
-    {
-        return !host.empty() && !user.empty() && !password.empty();
-    }
-
-    bool Call(const std::string &method, const Array &params, Value &result, std::string &error) const
-    {
-        if (!IsConfigured())
-        {
-            error = "RPC credentials are not set.";
-            return false;
-        }
-
-        CURL *curl = curl_easy_init();
-        if (!curl)
-        {
-            error = "Unable to initialize RPC client.";
-            return false;
-        }
-
-        std::string url = std::string(useSSL ? "https://" : "http://") + host + ":" + wxString::Format("%d", port).ToStdString();
-        Object request;
-        request.push_back(Pair("method", method));
-        request.push_back(Pair("params", params));
-        request.push_back(Pair("id", 1));
-        std::string payload = write_string(Value(request), false);
-
-        std::string response;
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "content-type: application/json");
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payload.size());
-        curl_easy_setopt(curl, CURLOPT_USERPWD, (user + ":" + password).c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK)
-        {
-            error = curl_easy_strerror(res);
-            return false;
-        }
-
-        Value replyValue;
-        if (!read_string(response, replyValue))
-        {
-            error = "Unable to parse RPC response.";
-            return false;
-        }
-
-        if (replyValue.type() != obj_type)
-        {
-            error = "Unexpected RPC response.";
-            return false;
-        }
-
-        Object reply = replyValue.get_obj();
-        Value errorVal = find_value(reply, "error");
-        if (errorVal.type() != null_type)
-        {
-            if (errorVal.type() == obj_type)
-            {
-                Object errorObj = errorVal.get_obj();
-                Value messageVal = find_value(errorObj, "message");
-                if (messageVal.type() == str_type)
-                    error = messageVal.get_str();
-                else
-                    error = JsonValueToString(errorVal);
-            }
-            else
-                error = JsonValueToString(errorVal);
-            return false;
-        }
-
-        result = find_value(reply, "result");
-        return true;
-    }
-
-private:
-    std::string host;
-    int port;
-    std::string user;
-    std::string password;
-    bool useSSL;
-};
+void TxToJSON(const CTransaction& tx, const uint256 hashBlock, json_spirit::Object& entry);
 
 class OverviewPanel : public wxPanel
 {
 public:
-    OverviewPanel(wxWindow *parent, RpcClient &rpcClientIn, wxStatusBar *statusBarIn)
-        : wxPanel(parent), rpcClient(rpcClientIn), statusBar(statusBarIn)
+    OverviewPanel(wxWindow *parent, wxStatusBar *statusBarIn)
+        : wxPanel(parent), statusBar(statusBarIn)
     {
         wxBoxSizer *mainSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -175,29 +93,14 @@ public:
 
     void Refresh()
     {
-        Value infoValue;
-        std::string error;
-        if (!rpcClient.Call("getinfo", Array(), infoValue, error))
-        {
-            ReportError("getinfo", error);
-            return;
-        }
-
-        Object infoObj = infoValue.get_obj();
-        clientVersion->SetLabel(JsonValueToString(find_value(infoObj, "version")));
-        protocolVersion->SetLabel(JsonValueToString(find_value(infoObj, "protocolversion")));
-        balance->SetLabel(JsonValueToString(find_value(infoObj, "balance")));
-        blocks->SetLabel(JsonValueToString(find_value(infoObj, "blocks")));
-        connections->SetLabel(JsonValueToString(find_value(infoObj, "connections")));
-        powAlgo->SetLabel(JsonValueToString(find_value(infoObj, "pow_algo")));
-        difficulty->SetLabel(JsonValueToString(find_value(infoObj, "difficulty")));
-
-        Value miningValue;
-        if (rpcClient.Call("getmininginfo", Array(), miningValue, error))
-        {
-            Object miningObj = miningValue.get_obj();
-            hashrate->SetLabel(JsonValueToString(find_value(miningObj, "hashespersec")) + " H/s");
-        }
+        clientVersion->SetLabel(FormatFullVersion());
+        protocolVersion->SetLabel(wxString::Format("%d", PROTOCOL_VERSION));
+        balance->SetLabel(FormatAmount(pwalletMain ? pwalletMain->GetBalance() : 0));
+        blocks->SetLabel(wxString::Format("%d", nBestHeight));
+        connections->SetLabel(wxString::Format("%lu", vNodes.size()));
+        powAlgo->SetLabel(GetAlgoLabel());
+        difficulty->SetLabel(wxString::Format("%.8f", GetDifficulty(NULL, miningAlgo)));
+        hashrate->SetLabel(wxString::Format("%.0f H/s", dHashesPerSec));
     }
 
 private:
@@ -209,17 +112,11 @@ private:
         grid->Add(valueLabel, 0, wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
     }
 
-    void ReportError(const std::string &context, const std::string &error)
-    {
-        statusBar->SetStatusText(wxString::Format("RPC error (%s): %s", context, error));
-    }
-
     void OnRefresh(wxCommandEvent &)
     {
         Refresh();
     }
 
-    RpcClient &rpcClient;
     wxStatusBar *statusBar;
     wxStaticText *clientVersion;
     wxStaticText *protocolVersion;
@@ -234,8 +131,8 @@ private:
 class WalletPanel : public wxPanel
 {
 public:
-    WalletPanel(wxWindow *parent, RpcClient &rpcClientIn, wxStatusBar *statusBarIn)
-        : wxPanel(parent), rpcClient(rpcClientIn), statusBar(statusBarIn)
+    WalletPanel(wxWindow *parent, wxStatusBar *statusBarIn)
+        : wxPanel(parent), statusBar(statusBarIn)
     {
         wxBoxSizer *mainSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -308,96 +205,89 @@ public:
 
     void Refresh()
     {
-        std::string error;
-        Value balanceValue;
-        if (rpcClient.Call("getbalance", Array(), balanceValue, error))
-            balanceText->SetLabel(JsonValueToString(balanceValue));
-        else
-            ReportError("getbalance", error);
+        balanceText->SetLabel(FormatAmount(pwalletMain ? pwalletMain->GetBalance() : 0));
 
         RefreshTransactions();
         RefreshReceived();
     }
 
 private:
-    void ReportError(const std::string &context, const std::string &error)
-    {
-        statusBar->SetStatusText(wxString::Format("RPC error (%s): %s", context, error));
-    }
-
     void RefreshTransactions()
     {
-        std::string error;
-        Array params;
-        params.push_back(Value("*"));
-        params.push_back(Value(10));
-        params.push_back(Value(0));
-        Value txValue;
-        if (!rpcClient.Call("listtransactions", params, txValue, error))
-        {
-            ReportError("listtransactions", error);
-            return;
-        }
-
         transactionsList->DeleteAllItems();
-        Array txArray = txValue.get_array();
+        if (!pwalletMain)
+            return;
+
+        std::list<CAccountingEntry> acentries;
+        CWallet::TxItems txOrdered = pwalletMain->OrderedTxItems(acentries, "*");
         long index = 0;
-        for (Array::const_iterator it = txArray.begin(); it != txArray.end(); ++it)
+        for (CWallet::TxItems::reverse_iterator it = txOrdered.rbegin(); it != txOrdered.rend(); ++it)
         {
-            if (it->type() != obj_type)
+            CWalletTx *const pwtx = (*it).second.first;
+            if (!pwtx)
                 continue;
-            Object txObj = it->get_obj();
-            long itemIndex = transactionsList->InsertItem(index, FormatTimestamp(find_value(txObj, "time")));
-            transactionsList->SetItem(itemIndex, 1, JsonValueToString(find_value(txObj, "category")));
-            transactionsList->SetItem(itemIndex, 2, JsonValueToString(find_value(txObj, "amount")));
-            transactionsList->SetItem(itemIndex, 3, JsonValueToString(find_value(txObj, "address")));
-            transactionsList->SetItem(itemIndex, 4, JsonValueToString(find_value(txObj, "txid")));
-            ++index;
+
+            int64 nFee = 0;
+            std::string strSentAccount;
+            std::list<std::pair<CTxDestination, int64> > listReceived;
+            std::list<std::pair<CTxDestination, int64> > listSent;
+            pwtx->GetAmounts(listReceived, listSent, nFee, strSentAccount);
+
+            if (!listSent.empty() || nFee != 0)
+            {
+                BOOST_FOREACH(const PAIRTYPE(CTxDestination, int64)& s, listSent)
+                {
+                    long itemIndex = transactionsList->InsertItem(index, FormatTimestamp(pwtx->GetTxTime()));
+                    transactionsList->SetItem(itemIndex, 1, "send");
+                    transactionsList->SetItem(itemIndex, 2, FormatAmount(-s.second));
+                    transactionsList->SetItem(itemIndex, 3, CBitcoinAddress(s.first).ToString());
+                    transactionsList->SetItem(itemIndex, 4, pwtx->GetHash().GetHex());
+                    ++index;
+                }
+            }
+
+            if (listReceived.size() > 0 && pwtx->GetDepthInMainChain() >= 0)
+            {
+                BOOST_FOREACH(const PAIRTYPE(CTxDestination, int64)& r, listReceived)
+                {
+                    long itemIndex = transactionsList->InsertItem(index, FormatTimestamp(pwtx->GetTxTime()));
+                    transactionsList->SetItem(itemIndex, 1, "receive");
+                    transactionsList->SetItem(itemIndex, 2, FormatAmount(r.second));
+                    transactionsList->SetItem(itemIndex, 3, CBitcoinAddress(r.first).ToString());
+                    transactionsList->SetItem(itemIndex, 4, pwtx->GetHash().GetHex());
+                    ++index;
+                }
+            }
+
+            if (index >= 10)
+                break;
         }
     }
 
     void RefreshReceived()
     {
-        std::string error;
-        Array params;
-        params.push_back(Value(1));
-        params.push_back(Value(false));
-        Value receivedValue;
-        if (!rpcClient.Call("listreceivedbyaddress", params, receivedValue, error))
-        {
-            ReportError("listreceivedbyaddress", error);
-            return;
-        }
-
         receivedList->DeleteAllItems();
-        Array receivedArray = receivedValue.get_array();
+        if (!pwalletMain)
+            return;
+
+        map<CTxDestination, int64> balances = pwalletMain->GetAddressBalances();
         long index = 0;
-        for (Array::const_iterator it = receivedArray.begin(); it != receivedArray.end(); ++it)
+        BOOST_FOREACH(const PAIRTYPE(CTxDestination, int64)& entry, balances)
         {
-            if (it->type() != obj_type)
-                continue;
-            Object obj = it->get_obj();
-            long itemIndex = receivedList->InsertItem(index, JsonValueToString(find_value(obj, "address")));
-            receivedList->SetItem(itemIndex, 1, JsonValueToString(find_value(obj, "account")));
-            receivedList->SetItem(itemIndex, 2, JsonValueToString(find_value(obj, "amount")));
-            receivedList->SetItem(itemIndex, 3, JsonValueToString(find_value(obj, "confirmations")));
+            long itemIndex = receivedList->InsertItem(index, CBitcoinAddress(entry.first).ToString());
+            std::string account;
+            if (pwalletMain->mapAddressBook.count(entry.first))
+                account = pwalletMain->mapAddressBook[entry.first];
+            receivedList->SetItem(itemIndex, 1, account);
+            receivedList->SetItem(itemIndex, 2, FormatAmount(entry.second));
+            receivedList->SetItem(itemIndex, 3, "1+");
             ++index;
         }
     }
 
-    wxString FormatTimestamp(const Value &value)
+    wxString FormatTimestamp(int64 timeValue)
     {
-        if (value.type() == int_type)
-        {
-            wxDateTime dt = wxDateTime::FromTimeT(value.get_int());
-            return dt.FormatISOCombined(' ');
-        }
-        if (value.type() == int64_type)
-        {
-            wxDateTime dt = wxDateTime::FromTimeT(static_cast<time_t>(value.get_int64()));
-            return dt.FormatISOCombined(' ');
-        }
-        return "-";
+        return wxString::FromUTF8(FormatTime(timeValue).c_str());
     }
 
     void OnRefresh(wxCommandEvent &)
@@ -407,19 +297,31 @@ private:
 
     void OnNewAddress(wxCommandEvent &)
     {
-        std::string error;
-        Value result;
-        if (rpcClient.Call("getnewaddress", Array(), result, error))
+        if (!pwalletMain)
         {
-            newAddress->SetValue(JsonValueToString(result));
-            statusBar->SetStatusText("Generated new receive address.");
+            statusBar->SetStatusText("Wallet not available.");
+            return;
         }
-        else
-            ReportError("getnewaddress", error);
+
+        CPubKey newKey;
+        if (!pwalletMain->GetKeyFromPool(newKey, false))
+        {
+            statusBar->SetStatusText("Keypool ran out.");
+            return;
+        }
+        CKeyID keyID = newKey.GetID();
+        pwalletMain->SetAddressBookName(keyID, "");
+        newAddress->SetValue(CBitcoinAddress(keyID).ToString());
+        statusBar->SetStatusText("Generated new receive address.");
     }
 
     void OnSend(wxCommandEvent &)
     {
+        if (!pwalletMain)
+        {
+            statusBar->SetStatusText("Wallet not available.");
+            return;
+        }
         std::string address = sendAddress->GetValue().ToStdString();
         double amount = 0.0;
         if (!sendAmount->GetValue().ToDouble(&amount))
@@ -433,21 +335,32 @@ private:
             return;
         }
 
-        Array params;
-        params.push_back(Value(address));
-        params.push_back(Value(amount));
-        Value result;
-        std::string error;
-        if (rpcClient.Call("sendtoaddress", params, result, error))
+        CBitcoinAddress destAddress(address);
+        if (!destAddress.IsValid())
         {
-            statusBar->SetStatusText("Transaction sent: " + JsonValueToString(result));
-            Refresh();
+            statusBar->SetStatusText("Invalid address.");
+            return;
         }
-        else
-            ReportError("sendtoaddress", error);
+
+        int64 nAmount = 0;
+        if (!ParseMoney(sendAmount->GetValue().ToStdString(), nAmount))
+        {
+            statusBar->SetStatusText("Invalid amount.");
+            return;
+        }
+
+        CWalletTx wtx;
+        std::string result = pwalletMain->SendMoneyToDestination(destAddress.Get(), nAmount, wtx);
+        if (!result.empty())
+        {
+            statusBar->SetStatusText(wxString::FromUTF8(result.c_str()));
+            return;
+        }
+
+        statusBar->SetStatusText("Transaction sent: " + wtx.GetHash().GetHex());
+        Refresh();
     }
 
-    RpcClient &rpcClient;
     wxStatusBar *statusBar;
     wxStaticText *balanceText;
     wxTextCtrl *sendAddress;
@@ -462,8 +375,8 @@ private:
 class ExplorerPanel : public wxPanel
 {
 public:
-    ExplorerPanel(wxWindow *parent, RpcClient &rpcClientIn, wxStatusBar *statusBarIn)
-        : wxPanel(parent), rpcClient(rpcClientIn), statusBar(statusBarIn)
+    ExplorerPanel(wxWindow *parent, wxStatusBar *statusBarIn)
+        : wxPanel(parent), statusBar(statusBarIn)
     {
         wxBoxSizer *mainSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -513,24 +426,17 @@ public:
     }
 
 private:
-    void ReportError(const std::string &context, const std::string &error)
-    {
-        statusBar->SetStatusText(wxString::Format("RPC error (%s): %s", context, error));
-    }
-
     void OnFetchHeight(wxCommandEvent &)
     {
-        Array params;
-        params.push_back(Value(blockHeight->GetValue()));
-        std::string error;
-        Value hashValue;
-        if (!rpcClient.Call("getblockhash", params, hashValue, error))
+        LOCK(cs_main);
+        CBlockIndex *pindex = FindBlockByHeight(blockHeight->GetValue());
+        if (!pindex)
         {
-            ReportError("getblockhash", error);
+            statusBar->SetStatusText("Block height not found.");
             return;
         }
-        blockHash->SetValue(JsonValueToString(hashValue));
-        FetchBlock(JsonValueToString(hashValue));
+        blockHash->SetValue(pindex->GetBlockHash().GetHex());
+        FetchBlock(pindex);
     }
 
     void OnFetchHash(wxCommandEvent &)
@@ -541,30 +447,34 @@ private:
             statusBar->SetStatusText("Enter a block hash.");
             return;
         }
-        FetchBlock(hash);
+        uint256 hashValue;
+        hashValue.SetHex(hash);
+        LOCK(cs_main);
+        if (!mapBlockIndex.count(hashValue))
+        {
+            statusBar->SetStatusText("Block not found.");
+            return;
+        }
+        FetchBlock(mapBlockIndex[hashValue]);
     }
 
-    void FetchBlock(const std::string &hash)
+    void FetchBlock(const CBlockIndex *pindex)
     {
-        Array params;
-        params.push_back(Value(hash));
-        Value blockValue;
-        std::string error;
-        if (!rpcClient.Call("getblock", params, blockValue, error))
+        if (!pindex)
+            return;
+        CBlock block;
+        if (!ReadBlockFromDisk(block, pindex))
         {
-            ReportError("getblock", error);
+            statusBar->SetStatusText("Unable to read block from disk.");
             return;
         }
 
-        Object blockObj = blockValue.get_obj();
         std::ostringstream summary;
-        summary << "Block " << JsonValueToString(find_value(blockObj, "height")) << "\n";
-        summary << "Hash: " << JsonValueToString(find_value(blockObj, "hash")) << "\n";
-        summary << "Confirmations: " << JsonValueToString(find_value(blockObj, "confirmations")) << "\n";
-        summary << "Time: " << JsonValueToString(find_value(blockObj, "time")) << "\n";
-        Value txs = find_value(blockObj, "tx");
-        if (txs.type() == array_type)
-            summary << "Transactions: " << txs.get_array().size() << "\n";
+        summary << "Block " << pindex->nHeight << "\n";
+        summary << "Hash: " << pindex->GetBlockHash().GetHex() << "\n";
+        summary << "Confirmations: " << pindex->GetDepthInMainChain() << "\n";
+        summary << "Time: " << FormatTime(block.GetBlockTime()) << "\n";
+        summary << "Transactions: " << block.vtx.size() << "\n";
         results->SetValue(summary.str());
     }
 
@@ -576,30 +486,21 @@ private:
             statusBar->SetStatusText("Enter a transaction id.");
             return;
         }
-
-        Array params;
-        params.push_back(Value(id));
-        Value rawValue;
-        std::string error;
-        if (!rpcClient.Call("getrawtransaction", params, rawValue, error))
+        uint256 hash;
+        hash.SetHex(id);
+        CTransaction tx;
+        uint256 hashBlock;
+        if (!GetTransaction(hash, tx, hashBlock, true))
         {
-            ReportError("getrawtransaction", error);
+            statusBar->SetStatusText("Transaction not found.");
             return;
         }
 
-        Array decodeParams;
-        decodeParams.push_back(rawValue);
-        Value decodedValue;
-        if (!rpcClient.Call("decoderawtransaction", decodeParams, decodedValue, error))
-        {
-            ReportError("decoderawtransaction", error);
-            return;
-        }
-
-        results->SetValue(write_string(decodedValue, true));
+        json_spirit::Object entry;
+        TxToJSON(tx, hashBlock, entry);
+        results->SetValue(json_spirit::write_string(json_spirit::Value(entry), true));
     }
 
-    RpcClient &rpcClient;
     wxStatusBar *statusBar;
     wxSpinCtrl *blockHeight;
     wxTextCtrl *blockHash;
@@ -610,8 +511,8 @@ private:
 class AiPanel : public wxPanel
 {
 public:
-    AiPanel(wxWindow *parent, RpcClient &rpcClientIn, wxStatusBar *statusBarIn)
-        : wxPanel(parent), rpcClient(rpcClientIn), statusBar(statusBarIn)
+    AiPanel(wxWindow *parent, wxStatusBar *statusBarIn)
+        : wxPanel(parent), statusBar(statusBarIn)
     {
         wxBoxSizer *mainSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -646,28 +547,10 @@ public:
 
     void Refresh()
     {
-        Value miningValue;
-        std::string error;
-        if (!rpcClient.Call("getmininginfo", Array(), miningValue, error))
-        {
-            ReportError("getmininginfo", error);
-            return;
-        }
-
-        Object miningObj = miningValue.get_obj();
-        powAlgo->SetLabel(JsonValueToString(find_value(miningObj, "pow_algo")));
-        difficulty->SetLabel(JsonValueToString(find_value(miningObj, "difficulty")));
-        hashrate->SetLabel(JsonValueToString(find_value(miningObj, "hashespersec")) + " H/s");
-
-        double difficultyVal = 0.0;
-        double hashrateVal = 0.0;
-        Value diffValue = find_value(miningObj, "difficulty");
-        if (diffValue.type() == real_type || diffValue.type() == int_type)
-            difficultyVal = diffValue.get_real();
-        Value hashValue = find_value(miningObj, "hashespersec");
-        if (hashValue.type() == real_type || hashValue.type() == int_type)
-            hashrateVal = hashValue.get_real();
-        double score = difficultyVal * hashrateVal;
+        powAlgo->SetLabel(GetAlgoLabel());
+        difficulty->SetLabel(wxString::Format("%.8f", GetDifficulty(NULL, miningAlgo)));
+        hashrate->SetLabel(wxString::Format("%.0f H/s", dHashesPerSec));
+        double score = GetDifficulty(NULL, miningAlgo) * dHashesPerSec;
         powerScore->SetLabel(wxString::Format("%.2f", score));
     }
 
@@ -680,17 +563,11 @@ private:
         grid->Add(valueLabel, 0, wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
     }
 
-    void ReportError(const std::string &context, const std::string &error)
-    {
-        statusBar->SetStatusText(wxString::Format("RPC error (%s): %s", context, error));
-    }
-
     void OnRefresh(wxCommandEvent &)
     {
         Refresh();
     }
 
-    RpcClient &rpcClient;
     wxStatusBar *statusBar;
     wxStaticText *description;
     wxStaticText *powAlgo;
@@ -707,85 +584,40 @@ public:
     {
         CreateStatusBar();
         statusBar = GetStatusBar();
-        statusBar->SetStatusText("Configure RPC access to begin.");
+        statusBar->SetStatusText("Initializing Trinity core...");
 
         wxBoxSizer *mainSizer = new wxBoxSizer(wxVERTICAL);
 
-        wxStaticBoxSizer *connectionSizer = new wxStaticBoxSizer(wxHORIZONTAL, this, "RPC Connection");
-        hostInput = new wxTextCtrl(this, wxID_ANY, "127.0.0.1");
-        portInput = new wxSpinCtrl(this, wxID_ANY);
-        portInput->SetRange(1, 65535);
-        portInput->SetValue(6420);
-        userInput = new wxTextCtrl(this, wxID_ANY);
-        passwordInput = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
-        sslCheckbox = new wxCheckBox(this, wxID_ANY, "Use SSL");
-        wxButton *connectButton = new wxButton(this, wxID_ANY, "Connect");
-        connectButton->Bind(wxEVT_BUTTON, &MainFrame::OnConnect, this);
-
-        connectionSizer->Add(new wxStaticText(this, wxID_ANY, "Host:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        connectionSizer->Add(hostInput, 0, wxRIGHT, 10);
-        connectionSizer->Add(new wxStaticText(this, wxID_ANY, "Port:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        connectionSizer->Add(portInput, 0, wxRIGHT, 10);
-        connectionSizer->Add(new wxStaticText(this, wxID_ANY, "User:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        connectionSizer->Add(userInput, 0, wxRIGHT, 10);
-        connectionSizer->Add(new wxStaticText(this, wxID_ANY, "Password:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        connectionSizer->Add(passwordInput, 0, wxRIGHT, 10);
-        connectionSizer->Add(sslCheckbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
-        connectionSizer->Add(connectButton, 0);
-
         notebook = new wxNotebook(this, wxID_ANY);
-        overviewPanel = new OverviewPanel(notebook, rpcClient, statusBar);
-        walletPanel = new WalletPanel(notebook, rpcClient, statusBar);
-        explorerPanel = new ExplorerPanel(notebook, rpcClient, statusBar);
-        aiPanel = new AiPanel(notebook, rpcClient, statusBar);
+        overviewPanel = new OverviewPanel(notebook, statusBar);
+        walletPanel = new WalletPanel(notebook, statusBar);
+        explorerPanel = new ExplorerPanel(notebook, statusBar);
+        aiPanel = new AiPanel(notebook, statusBar);
 
         notebook->AddPage(overviewPanel, "Overview", true);
         notebook->AddPage(walletPanel, "Wallet");
         notebook->AddPage(explorerPanel, "Explorer");
         notebook->AddPage(aiPanel, "AI Power");
 
-        mainSizer->Add(connectionSizer, 0, wxALL | wxEXPAND, 12);
         mainSizer->Add(notebook, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 12);
 
         SetSizer(mainSizer);
     }
 
-private:
-    void OnConnect(wxCommandEvent &)
+    void RefreshPanels()
     {
-        rpcClient.Configure(
-            hostInput->GetValue().ToStdString(),
-            portInput->GetValue(),
-            userInput->GetValue().ToStdString(),
-            passwordInput->GetValue().ToStdString(),
-            sslCheckbox->IsChecked());
-
-        if (!rpcClient.IsConfigured())
-        {
-            statusBar->SetStatusText("Provide RPC username and password.");
-            return;
-        }
-
-        statusBar->SetStatusText("Connecting to Trinity RPC...");
         overviewPanel->Refresh();
         walletPanel->Refresh();
         explorerPanel->Refresh();
         aiPanel->Refresh();
-        statusBar->SetStatusText("RPC connected.");
     }
 
-    RpcClient rpcClient;
     wxStatusBar *statusBar;
     wxNotebook *notebook;
     OverviewPanel *overviewPanel;
     WalletPanel *walletPanel;
     ExplorerPanel *explorerPanel;
     AiPanel *aiPanel;
-    wxTextCtrl *hostInput;
-    wxSpinCtrl *portInput;
-    wxTextCtrl *userInput;
-    wxTextCtrl *passwordInput;
-    wxCheckBox *sslCheckbox;
 };
 
 class TrinityWxApp : public wxApp
@@ -793,16 +625,65 @@ class TrinityWxApp : public wxApp
 public:
     bool OnInit() override
     {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
+        fHaveGUI = true;
+        ParseParameters(argc, argv);
+        ReadConfigFile(mapArgs, mapMultiArgs);
+        if (!boost::filesystem::is_directory(GetDataDir(false)))
+        {
+            wxMessageBox("Data directory not found. Check -datadir.", "Trinity");
+            return false;
+        }
+
+        uiInterface.ThreadSafeMessageBox.connect(ThreadSafeMessageBox);
+        uiInterface.ThreadSafeAskFee.connect(ThreadSafeAskFee);
+        uiInterface.InitMessage.connect(InitMessage);
+        uiInterface.Translate.connect(Translate);
+
         MainFrame *frame = new MainFrame();
         frame->Show(true);
+        frame->Raise();
+        frame->GetStatusBar()->SetStatusText("Starting Trinity core...");
+        frame->Update();
+        frame->Layout();
+
+        threadGroup = new boost::thread_group;
+        threadGroup->create_thread(boost::bind(&TrinityWxApp::InitializeCore, this, frame));
+
         return true;
     }
 
     int OnExit() override
     {
-        curl_global_cleanup();
+        if (threadGroup)
+        {
+            threadGroup->interrupt_all();
+            threadGroup->join_all();
+            delete threadGroup;
+            threadGroup = NULL;
+        }
+        Shutdown();
         return 0;
+    }
+
+private:
+    boost::thread_group *threadGroup = NULL;
+
+    void InitializeCore(MainFrame *frame)
+    {
+        if (!AppInit2(*threadGroup))
+        {
+            wxCallAfter([frame]() {
+                frame->GetStatusBar()->SetStatusText("Core startup failed.");
+            });
+            return;
+        }
+
+        wxCallAfter([frame]() {
+            frame->GetStatusBar()->SetStatusText("Trinity core linked.");
+            frame->Update();
+            frame->Layout();
+            frame->RefreshPanels();
+        });
     }
 };
 
