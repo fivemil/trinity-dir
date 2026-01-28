@@ -25,15 +25,18 @@ Trinity requires the following dependencies to build:
 
 ```bash
 sudo apt-get update
-sudo apt-get install build-essential libboost1.49-dev libssl-dev libdb4.8-dev libdb4.8++-dev libqrencode-dev libminiupnpc-dev git
+sudo apt-get install build-essential libboost-all-dev libssl-dev libdb4.8-dev libdb4.8++-dev libqrencode-dev libminiupnpc-dev git
 ```
+
+**Note**: On older systems, you may need to use version-specific packages like `libboost1.49-dev` or `libboost1.55-dev` instead of `libboost-all-dev`.
 
 ### Compilation
 
 To build the Trinity daemon:
 
 ```bash
-make -f Makefile
+cd src
+make -f makefile.unix
 ```
 
 For the Qt GUI wallet:
